@@ -13,10 +13,20 @@ import asyncio
 import contextlib
 import logging
 import os
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from loguru import logger as loguru_logger
 
 from dr_ai_palletizer.api_models import (
     HealthResponse,
@@ -36,7 +46,10 @@ from dr_ai_palletizer.control_loop import ControlLoop
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logging.getLogger("dr_ai_palletizer").setLevel(logging.INFO)
 
-logger = logging.getLogger(__name__)
+# Use Loguru for richer logs
+loguru_logger.remove()
+loguru_logger.add(sys.stderr, level="INFO", format="{time} | {level} | {message}")
+logger = loguru_logger
 
 _control_loop: ControlLoop | None = None
 _loop_task: asyncio.Task | None = None
@@ -104,6 +117,21 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(title="DR AI Palletizer", lifespan=_lifespan)
 
+# CORS configuration – allow origins from environment or default to all for dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate limiting – 60 requests per minute per IP by default
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
 
 async def _stop_loop() -> None:
     global _loop_task
@@ -122,11 +150,13 @@ async def _stop_loop() -> None:
 
 
 @app.get("/api/health", response_model=HealthResponse)
+@limiter.limit("10/second")
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
 @app.get("/api/status", response_model=StatusResponse)
+@limiter.limit("5/second")
 async def get_status() -> StatusResponse:
     loop_state = _control_loop.state if _control_loop else "idle"
     services: list[ServiceHealth] = []
