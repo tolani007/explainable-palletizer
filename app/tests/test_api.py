@@ -97,9 +97,18 @@ class TestPlan:
 
 
 class TestPalletize:
-    def test_returns_stub(self, client: TestClient) -> None:
-        resp = client.post("/api/palletize", json={})
+    def test_rejects_empty_scenario(self, client: TestClient) -> None:
+        resp = client.post("/api/palletize", json={"scenario_text": ""})
+        assert resp.status_code == 400
+
+    def test_calls_inference_on_valid_scenario(self, client: TestClient) -> None:
+        client.app.state.inference_client.get_plan = AsyncMock(
+            return_value="<think>ok</think>\n{\"action\":\"WAIT\"}",
+        )
+        resp = client.post(
+            "/api/palletize", json={"scenario_text": "step 1, one box visible"}
+        )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
-        assert "not yet implemented" in data["message"].lower()
+        assert data["status"] == "ok"
+        assert "WAIT" in data["message"]

@@ -25,10 +25,16 @@ class InferenceClient:
         Request timeout in seconds.
     """
 
-    def __init__(self, base_url: str, model: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: float = 30.0,
+        api_key: str = "unused",
+    ) -> None:
         self._client = AsyncOpenAI(
             base_url=base_url,
-            api_key="unused",
+            api_key=api_key,
             timeout=timeout,
         )
         self._model = model
@@ -45,7 +51,13 @@ class InferenceClient:
             logger.warning("Inference server health check failed", exc_info=True)
             return False
 
-    async def get_plan(self, system_prompt: str, scenario_text: str) -> str:
+    async def get_plan(
+        self,
+        system_prompt: str,
+        scenario_text: str,
+        *,
+        model: str | None = None,
+    ) -> str:
         """Send a palletizing scenario to the model and return the response text.
 
         Parameters
@@ -61,7 +73,7 @@ class InferenceClient:
             The model's generated response text.
         """
         response = await self._client.chat.completions.create(
-            model=self._model,
+            model=model or self._model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": scenario_text},
@@ -83,6 +95,7 @@ class InferenceClient:
         scenario_text: str,
         *,
         max_tokens: int = 2048,
+        model: str | None = None,
     ) -> str:
         """Send multimodal palletizing prompt and return the model's response.
 
@@ -111,7 +124,7 @@ class InferenceClient:
         content_parts.append({"type": "text", "text": scenario_text})
 
         response = await self._client.chat.completions.create(
-            model=self._model,
+            model=model or self._model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content_parts},

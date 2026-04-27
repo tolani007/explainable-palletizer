@@ -17,7 +17,7 @@ import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -37,6 +37,12 @@ from dr_ai_palletizer.api_models import (
     ServiceHealth,
     StatusResponse,
 )
+from dr_ai_palletizer.agents import (
+    Conductor,
+    PerceptionAgent,
+    PlannerAgent,
+    VerifierAgent,
+)
 from dr_ai_palletizer.clients.inference_client import InferenceClient
 from dr_ai_palletizer.clients.sim_client import SimClient
 from dr_ai_palletizer.config import Settings
@@ -55,6 +61,8 @@ logger = loguru_logger
 _control_loop: ControlLoop | DemoControlLoop | None = None
 _loop_task: asyncio.Task | None = None
 _demo_mode: bool = False
+_conductor: Conductor | None = None
+_nvidia_client: InferenceClient | None = None
 
 # WebSocket event subscribers (control-loop broadcasts)
 _event_subs: set[WebSocket] = set()
@@ -77,20 +85,46 @@ async def _broadcast_event(event: dict) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _control_loop, _demo_mode
+    global _control_loop, _demo_mode, _conductor, _nvidia_client
 
     settings = Settings()
     app.state.settings = settings
     _demo_mode = bool(settings.demo_mode)
 
+    # Build the Conductor team if NVIDIA hosted endpoints are configured.
+    # The same Conductor instance powers /api/palletize one-shot calls and,
+    # when demo_mode is on, drives the streaming scenario loop.
+    if settings.use_nvidia_endpoint:
+        _nvidia_client = InferenceClient(
+            base_url=settings.nvidia_base_url,
+            model=settings.conductor_model,
+            timeout=settings.request_timeout,
+            api_key=settings.nvidia_api_key,
+        )
+        _conductor = Conductor(
+            perception=PerceptionAgent(client=_nvidia_client, model=settings.perception_model),
+            planner=PlannerAgent(client=_nvidia_client, model=settings.planner_model),
+            verifier=VerifierAgent(client=_nvidia_client, model=settings.verifier_model),
+        )
+        logger.info(
+            "Conductor team online: perception={}  planner={}  verifier={}",
+            settings.perception_model,
+            settings.planner_model,
+            settings.verifier_model,
+        )
+
     if _demo_mode:
-        # Demo build: skip the sim/inference clients entirely. Anything that
-        # needs them in production (status checks, plan endpoint) returns a
-        # deterministic synthetic response.
+        # Cloud / preview build: skip the GPU sim and self-hosted vLLM. The
+        # streaming loop generates synthetic scenarios; if a Conductor is
+        # available it drives real NVIDIA-endpoint inference for each step,
+        # otherwise it falls back to fully synthetic events for CI smoke runs.
         app.state.sim_client = None
         app.state.inference_client = None
-        _control_loop = DemoControlLoop(_broadcast_event)
-        logger.info("Server started in DEMO MODE -- no GPU services required")
+        _control_loop = DemoControlLoop(_broadcast_event, conductor=_conductor)
+        logger.info(
+            "Server started in DEMO MODE (conductor={}); no GPU services required",
+            "online" if _conductor else "synthetic-fallback",
+        )
     else:
         app.state.sim_client = SimClient(
             base_url=settings.sim_server_url,
@@ -125,7 +159,11 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await app.state.sim_client.close()
     if app.state.inference_client is not None:
         await app.state.inference_client.close()
+    if _nvidia_client is not None:
+        await _nvidia_client.close()
     _control_loop = None
+    _conductor = None
+    _nvidia_client = None
 
 
 app = FastAPI(title="DR AI Palletizer", lifespan=_lifespan)
@@ -143,14 +181,26 @@ app.add_middleware(
 @app.get("/api/info")
 async def info() -> dict:
     """Public build info -- safe to expose to the UI for the badge in the header."""
+    settings: Settings = app.state.settings
+    team: dict | None = None
+    if _conductor is not None:
+        team = {
+            "perception": settings.perception_model,
+            "planner": settings.planner_model,
+            "verifier": settings.verifier_model,
+            "conductor": settings.conductor_model,
+            "endpoint": settings.nvidia_base_url,
+        }
+    fallback_model = (
+        "synthetic (no NVIDIA key)"
+        if _demo_mode and _conductor is None
+        else settings.active_model
+    )
     return {
         "name": "DR AI Palletizer",
         "demo_mode": _demo_mode,
-        "model": (
-            "demo://cosmos-reason2-8b (synthetic)"
-            if _demo_mode
-            else app.state.settings.active_model
-        ),
+        "model": fallback_model,
+        "team": team,
         "version": os.getenv("APP_VERSION", "dev"),
     }
 
@@ -182,13 +232,13 @@ async def _stop_loop() -> None:
 
 @app.get("/api/health", response_model=HealthResponse)
 @limiter.limit("10/second")
-async def health() -> HealthResponse:
+async def health(request: Request) -> HealthResponse:
     return HealthResponse(status="ok")
 
 
 @app.get("/api/status", response_model=StatusResponse)
 @limiter.limit("5/second")
-async def get_status() -> StatusResponse:
+async def get_status(request: Request) -> StatusResponse:
     loop_state = _control_loop.state if _control_loop else "idle"
     services: list[ServiceHealth] = []
 
@@ -335,15 +385,32 @@ async def palletize(request: PalletizeRequest) -> PalletizeResponse:
     """One-shot palletize call.
 
     Given a scenario text describing the boxes and pallet state, this
-    returns a single explainable decision (reasoning + JSON action). It is
-    the synchronous counterpart to the streaming `/api/control/start`
-    control loop -- useful for batch evaluation, regression tests, and for
-    third-party integrations that don't want to keep a WebSocket open.
+    returns a single explainable decision (reasoning + JSON action). When a
+    Conductor team is configured (i.e. `NVIDIA_API_KEY` is set) this runs
+    the full perception → planner → verifier pipeline; the response carries
+    the full transcript so the caller can audit each agent's contribution.
     """
     from dr_ai_palletizer.api_models import SYSTEM_PROMPT
 
+    if _conductor is not None:
+        # Drive the Conductor team. Without a real image we still hit the
+        # text path; perception falls back to text-only stub.
+        if not request.scenario_text.strip():
+            raise HTTPException(status_code=400, detail="scenario_text is required")
+        try:
+            result = await _conductor.run(
+                scenario_text=request.scenario_text,
+                boxes=[],  # text-only one-shot: no images
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Conductor error: {exc}") from exc
+        transcript_text = "\n\n".join(
+            f"[{m.role}@{m.model}]\n{m.content}" for m in result.transcript
+        )
+        return PalletizeResponse(status="ok", message=transcript_text)
+
     if _demo_mode:
-        # Synthesize a deterministic decision for the demo build.
+        # CI fallback: synthesize a deterministic decision when no NVIDIA key.
         from dr_ai_palletizer.demo_mode import (
             _DEMO_BOXES,
             _build_action,

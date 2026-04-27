@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import logging
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dr_ai_palletizer.agents import Conductor
 
 logger = logging.getLogger(__name__)
 
@@ -157,9 +160,16 @@ class DemoControlLoop:
     can swap implementations based on `Settings.demo_mode`.
     """
 
-    def __init__(self, broadcast: EventBroadcaster, *, step_period: float = 4.0) -> None:
+    def __init__(
+        self,
+        broadcast: EventBroadcaster,
+        *,
+        step_period: float = 4.0,
+        conductor: "Conductor | None" = None,
+    ) -> None:
         self._broadcast = broadcast
         self._step_period = step_period
+        self._conductor = conductor
         self._state = "idle"
         self._stop = asyncio.Event()
         self._pause = asyncio.Event()
@@ -199,21 +209,60 @@ class DemoControlLoop:
         await self._emit_box_images(list(boxes))
 
         await self._broadcast({"type": "status", "state": "thinking"})
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.3)
 
-        # Pick a primary box (damaged first, otherwise the heaviest)
+        if self._conductor is not None:
+            await self._step_with_conductor(boxes)
+        else:
+            await self._step_synthetic(boxes, rng)
+        await self._broadcast({"type": "status", "state": "running"})
+        self._step_count += 1
+
+    async def _step_synthetic(self, boxes: list[_DemoBox], rng: random.Random) -> None:
         primary = next((b for b in boxes if b.damaged), None) or max(boxes, key=lambda b: b.weight_kg)
         pallet_idx = rng.choice([1, 2])
         position = (rng.randrange(0, 4), rng.randrange(0, 4), rng.randrange(0, 3))
-
         for line in _build_reasoning(primary, pallet_idx, position):
             await self._broadcast({"type": "reasoning", "content": line})
             await asyncio.sleep(0.35)
-
         action = _build_action(primary, pallet_idx, position)
         await self._broadcast({"type": "action", "content": _format_action(action)})
-        await self._broadcast({"type": "status", "state": "running"})
-        self._step_count += 1
+
+    async def _step_with_conductor(self, boxes: list[_DemoBox]) -> None:
+        """Run a real Conductor turn over NVIDIA hosted endpoints."""
+        scenario_text = _scenario_text(boxes, step=self._step_count)
+        # Emit each agent message as a typed event so the UI can show the team.
+        async def emit(msg) -> None:  # AgentMessage; avoid import cycle
+            await self._broadcast(
+                {
+                    "type": "agent_message",
+                    "agent": msg.role,
+                    "model": msg.model,
+                    "content": _strip_think(msg.content),
+                    "data": _safe_data(msg.data),
+                }
+            )
+
+        # Wire the emit on the conductor for this turn.
+        prev_emit = self._conductor.emit
+        self._conductor.emit = emit
+        try:
+            box_inputs = [
+                (b.box_id, _solid_png(64, 48, b.color), f"{b.weight_kg}kg, {b.shape[0]}d x {b.shape[1]}d x {b.shape[2]}d, {b.label}")
+                for b in boxes
+            ]
+            try:
+                result = await self._conductor.run(scenario_text=scenario_text, boxes=box_inputs)
+            except Exception as exc:
+                logger.exception("Conductor step failed")
+                await self._broadcast({"type": "reasoning", "content": f"Conductor error: {exc}"})
+                return
+        finally:
+            self._conductor.emit = prev_emit
+
+        await self._broadcast(
+            {"type": "action", "content": _format_action(result.action) if result.action else "WAIT"}
+        )
 
     async def _run(self) -> None:
         rng = random.Random(7)
@@ -263,6 +312,33 @@ class DemoControlLoop:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+
+def _scenario_text(boxes: list[_DemoBox], *, step: int) -> str:
+    """Plain-text pallet state + valid-position summary for the planner."""
+    lines = [f"Step {step}.", "Boxes visible at the conveyor head:"]
+    for b in boxes:
+        lines.append(
+            f"  - {b.box_id}: {b.weight_kg}kg, "
+            f"{b.shape[0]}d x {b.shape[1]}d x {b.shape[2]}d, label='{b.label}'"
+        )
+    lines.append("")
+    lines.append("Pallet 1: empty floor layer (z=0). Pallet 2: empty.")
+    lines.append("Valid positions: any (x in 0..3, y in 0..3, z in 0..2).")
+    lines.append("Last action: PICK_AND_PLACE.")
+    return "\n".join(lines)
+
+
+def _strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks for UI display."""
+    import re
+
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _safe_data(data: dict) -> dict:
+    """Drop non-JSON-serializable fields (e.g. raw image bytes)."""
+    return {k: v for k, v in data.items() if not isinstance(v, (bytes, bytearray))}
 
 
 def _format_action(action: dict) -> str:
