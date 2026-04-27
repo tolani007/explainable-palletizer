@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     max_completion_tokens: int = 2048
     lora_adapter_path: str = ""
     step_log_dir: str = ""
+    # Demo mode: when true, the server bypasses sim/inference clients and
+    # runs an in-process synthetic event generator. Used for cloud / GitHub
+    # Pages previews where no NVIDIA GPU is available.
+    demo_mode: bool = False
+    cors_origins: str = "*"
 
     @field_validator("lora_adapter_path", mode="before")
     @classmethod

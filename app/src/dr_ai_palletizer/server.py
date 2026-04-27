@@ -41,6 +41,7 @@ from dr_ai_palletizer.clients.inference_client import InferenceClient
 from dr_ai_palletizer.clients.sim_client import SimClient
 from dr_ai_palletizer.config import Settings
 from dr_ai_palletizer.control_loop import ControlLoop
+from dr_ai_palletizer.demo_mode import DemoControlLoop
 
 # Configure application logging so control-loop INFO messages appear
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -51,8 +52,9 @@ loguru_logger.remove()
 loguru_logger.add(sys.stderr, level="INFO", format="{time} | {level} | {message}")
 logger = loguru_logger
 
-_control_loop: ControlLoop | None = None
+_control_loop: ControlLoop | DemoControlLoop | None = None
 _loop_task: asyncio.Task | None = None
+_demo_mode: bool = False
 
 # WebSocket event subscribers (control-loop broadcasts)
 _event_subs: set[WebSocket] = set()
@@ -75,43 +77,54 @@ async def _broadcast_event(event: dict) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _control_loop
+    global _control_loop, _demo_mode
 
     settings = Settings()
-
-    app.state.sim_client = SimClient(
-        base_url=settings.sim_server_url,
-        timeout=settings.request_timeout,
-    )
-    app.state.inference_client = InferenceClient(
-        base_url=settings.inference_server_url,
-        model=settings.active_model,
-        timeout=settings.request_timeout,
-    )
     app.state.settings = settings
+    _demo_mode = bool(settings.demo_mode)
 
-    _control_loop = ControlLoop(
-        app.state.sim_client,
-        app.state.inference_client,
-        _broadcast_event,
-        max_completion_tokens=settings.max_completion_tokens,
-        use_few_shot=not settings.lora_adapter_path,
-        step_log_dir=settings.step_log_dir,
-    )
+    if _demo_mode:
+        # Demo build: skip the sim/inference clients entirely. Anything that
+        # needs them in production (status checks, plan endpoint) returns a
+        # deterministic synthetic response.
+        app.state.sim_client = None
+        app.state.inference_client = None
+        _control_loop = DemoControlLoop(_broadcast_event)
+        logger.info("Server started in DEMO MODE -- no GPU services required")
+    else:
+        app.state.sim_client = SimClient(
+            base_url=settings.sim_server_url,
+            timeout=settings.request_timeout,
+        )
+        app.state.inference_client = InferenceClient(
+            base_url=settings.inference_server_url,
+            model=settings.active_model,
+            timeout=settings.request_timeout,
+        )
+        _control_loop = ControlLoop(
+            app.state.sim_client,
+            app.state.inference_client,
+            _broadcast_event,
+            max_completion_tokens=settings.max_completion_tokens,
+            use_few_shot=not settings.lora_adapter_path,
+            step_log_dir=settings.step_log_dir,
+        )
 
-    prompt_mode = "fine-tuned (LoRA)" if settings.lora_adapter_path else "few-shot"
-    logger.info(
-        "Server started (sim=%s, inference=%s, model=%s, prompt=%s)",
-        settings.sim_server_url,
-        settings.inference_server_url,
-        settings.active_model,
-        prompt_mode,
-    )
+        prompt_mode = "fine-tuned (LoRA)" if settings.lora_adapter_path else "few-shot"
+        logger.info(
+            "Server started (sim=%s, inference=%s, model=%s, prompt=%s)",
+            settings.sim_server_url,
+            settings.inference_server_url,
+            settings.active_model,
+            prompt_mode,
+        )
     yield
 
     await _stop_loop()
-    await app.state.sim_client.close()
-    await app.state.inference_client.close()
+    if app.state.sim_client is not None:
+        await app.state.sim_client.close()
+    if app.state.inference_client is not None:
+        await app.state.inference_client.close()
     _control_loop = None
 
 
@@ -126,6 +139,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/api/info")
+async def info() -> dict:
+    """Public build info -- safe to expose to the UI for the badge in the header."""
+    return {
+        "name": "DR AI Palletizer",
+        "demo_mode": _demo_mode,
+        "model": (
+            "demo://cosmos-reason2-8b (synthetic)"
+            if _demo_mode
+            else app.state.settings.active_model
+        ),
+        "version": os.getenv("APP_VERSION", "dev"),
+    }
+
 # Rate limiting – 60 requests per minute per IP by default
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app.state.limiter = limiter
@@ -137,6 +165,9 @@ async def _stop_loop() -> None:
     global _loop_task
     if _control_loop is not None:
         _control_loop.reset()
+        # The demo loop owns its own task -- await it to fully drain.
+        if isinstance(_control_loop, DemoControlLoop):
+            await _control_loop.aclose()
     if _loop_task is not None and not _loop_task.done():
         _loop_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -160,6 +191,17 @@ async def health() -> HealthResponse:
 async def get_status() -> StatusResponse:
     loop_state = _control_loop.state if _control_loop else "idle"
     services: list[ServiceHealth] = []
+
+    if _demo_mode:
+        services.append(
+            ServiceHealth(name="sim-server", healthy=True, detail="demo (synthetic)")
+        )
+        services.append(
+            ServiceHealth(name="inference-server", healthy=True, detail="demo (synthetic)")
+        )
+        return StatusResponse(
+            status="ok", services=services, state=loop_state, sim_running=True
+        )
 
     try:
         sim_health = await app.state.sim_client.health()
@@ -201,6 +243,11 @@ async def control_start() -> dict:
     # Prevent duplicate loops: if already running, just return success
     if _loop_task is not None and not _loop_task.done():
         return {"ok": True, "state": "running"}
+
+    if _demo_mode:
+        await _control_loop.start()
+        return {"ok": True, "state": "running"}
+
     sim: SimClient = app.state.sim_client
     # Fill buffer BEFORE play to prevent extra box spawns during the race
     await sim.fill_buffer()
@@ -237,8 +284,9 @@ async def control_resume() -> dict:
 @app.post("/api/control/reset")
 async def control_reset() -> dict:
     await _stop_loop()
-    sim: SimClient = app.state.sim_client
-    await sim.reset()
+    if not _demo_mode:
+        sim: SimClient = app.state.sim_client
+        await sim.reset()
     return {"ok": True, "state": "idle"}
 
 
@@ -249,6 +297,23 @@ async def control_reset() -> dict:
 
 @app.post("/api/plan", response_model=PlanResponse)
 async def plan(request: PlanRequest) -> PlanResponse:
+    if _demo_mode:
+        from dr_ai_palletizer.demo_mode import (
+            _DEMO_BOXES,
+            _build_action,
+            _build_reasoning,
+            _format_action,
+        )
+
+        primary = _DEMO_BOXES[0]
+        position = (0, 0, 0)
+        reasoning = "\n".join(_build_reasoning(primary, 1, position))
+        action = _build_action(primary, 1, position)
+        return PlanResponse(
+            plan=f"<think>\n{reasoning}\n</think>\n\n<answer>\n{_format_action(action)}\n</answer>",
+            model="demo://cosmos-reason2-8b (synthetic)",
+        )
+
     from dr_ai_palletizer.domain.models import COSMOS2_TASK_PROMPT
 
     system_prompt = request.system_prompt or COSMOS2_TASK_PROMPT
@@ -267,10 +332,44 @@ async def plan(request: PlanRequest) -> PlanResponse:
 
 @app.post("/api/palletize", response_model=PalletizeResponse)
 async def palletize(request: PalletizeRequest) -> PalletizeResponse:
-    return PalletizeResponse(
-        status="accepted",
-        message="Palletize orchestration not yet implemented.",
-    )
+    """One-shot palletize call.
+
+    Given a scenario text describing the boxes and pallet state, this
+    returns a single explainable decision (reasoning + JSON action). It is
+    the synchronous counterpart to the streaming `/api/control/start`
+    control loop -- useful for batch evaluation, regression tests, and for
+    third-party integrations that don't want to keep a WebSocket open.
+    """
+    from dr_ai_palletizer.api_models import SYSTEM_PROMPT
+
+    if _demo_mode:
+        # Synthesize a deterministic decision for the demo build.
+        from dr_ai_palletizer.demo_mode import (
+            _DEMO_BOXES,
+            _build_action,
+            _build_reasoning,
+            _format_action,
+        )
+
+        primary = _DEMO_BOXES[0]
+        position = (0, 0, 0)
+        reasoning = "\n".join(_build_reasoning(primary, 1, position))
+        action = _build_action(primary, 1, position)
+        return PalletizeResponse(
+            status="ok",
+            message=f"<think>\n{reasoning}\n</think>\n\n<answer>\n{_format_action(action)}\n</answer>",
+        )
+
+    if not request.scenario_text.strip():
+        raise HTTPException(status_code=400, detail="scenario_text is required")
+    try:
+        result = await app.state.inference_client.get_plan(
+            system_prompt=SYSTEM_PROMPT,
+            scenario_text=request.scenario_text,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Inference server error: {exc}") from exc
+    return PalletizeResponse(status="ok", message=result)
 
 
 # ---------------------------------------------------------------------------
